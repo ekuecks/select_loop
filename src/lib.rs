@@ -1,5 +1,6 @@
-use std::future::Future;
 pub use futures;
+pub use paste::paste;
+use std::future::Future;
 
 trait Generator {
     type Fut: Future;
@@ -7,7 +8,11 @@ trait Generator {
     fn gen(&self) -> Self::Fut;
 }
 
-impl<Fut, T> Generator for T where Fut: Future, T: Fn() -> Fut {
+impl<Fut, T> Generator for T
+where
+    Fut: Future,
+    T: Fn() -> Fut,
+{
     type Fut = Fut;
 
     fn gen(&self) -> Self::Fut {
@@ -31,71 +36,72 @@ macro_rules! select_loop {
 
     // All input is normalized, now transform.
     (@ {
-        ( $($count:tt)* )
+        ( $($skip:tt)+ )
         // Normalized select_loop branches. `( $skip )` is a set of `_` characters.
         // There is one `_` for each select_loop branch **before** this one. Given
         // that all input futures are stored in a tuple, $skip is useful for
         // generating a pattern to reference the future for the current branch.
         // $skip is also used as an argument to `count!`, returning the index of
         // the current select_loop branch.
-        $( ( $($skip:tt)* ) $bind:pat = $gen:expr, if $c:expr => $handle:expr, )+
+        $( ( $($variant:tt)+ ) $bind:pat = $gen:expr, if $c:expr => $handle:expr, )+
     }) => {{
         // Create a scope to separate polling from handling the output. This
         // adds borrow checker flexibility when using the macro.
         {
-            use $crate::Generator;
-            use ::std::iter::FromIterator;
-            use $crate::futures::future::FutureExt;
-            use $crate::futures::StreamExt;
-
-            enum __ControlFlow<C, B> {
-                Continue(C),
-                Break(B),
+            $crate::paste!{
+                enum ReturnValue<$([<$($variant)+>]),+> {
+                    $([<$($variant)+>]([<$($variant)+>]),)+
+                }
             }
 
-            struct RecursiveGenerator<'a, T> {
-                inner: ::std::boxed::Box<dyn Generator<Fut = $crate::futures::future::BoxFuture<'a, __ControlFlow<(), T>>> + Send + Sync + 'a>,
+            $crate::paste!{
+                struct RecursiveGenerator<'a, $([<$($variant)+>]),+> {
+                    inner: ::std::boxed::Box<
+                        dyn $crate::Generator<
+                            Fut = $crate::futures::future::BoxFuture<'a, ReturnValue<$([<$($variant)+>]),+>>
+                        >
+                        + Send + Sync + 'a
+                    >,
+                }
             }
 
-            async fn generate<'a, T>(generator: RecursiveGenerator<'a, T>) -> __ControlFlow<RecursiveGenerator<'a, T>, T> {
-                generator.inner.gen().map(|v| match v {
-                    __ControlFlow::Continue(()) => __ControlFlow::Continue(generator),
-                    __ControlFlow::Break(v) => __ControlFlow::Break(v),
-                }).await
+            $crate::paste!{
+                async fn generate<'a, $([<$($variant)+>]),+>(
+                    generator: RecursiveGenerator<'a,  $([<$($variant)+>]),+>
+                ) -> (RecursiveGenerator<'a, $([<$($variant)+>]),+>, ReturnValue<$([<$($variant)+>]),+>) {
+                    $crate::futures::FutureExt::map(generator.inner.gen(), |v| (generator, v)).await
+                }
             }
 
             let mut __futures = Vec::new();
             $(
-                let __inner: ::std::boxed::Box<dyn Generator<Fut = _> + Send + Sync> = ::std::boxed::Box::new(|| {
-                    $crate::futures::future::FutureExt::boxed($gen().then(|__v| {
-                        #[allow(unreachable_code, unused_variables)]
-                        async move {
-                            let value = loop {
-                                if let $bind = __v {
-                                    if $c {
-                                        $handle
-                                    }
-                                }
-                                return __ControlFlow::Continue(());
-                            };
-                            return __ControlFlow::Break(value);
-                        }
-                }))
-                });
+                $crate::paste!{
+                    let __inner: ::std::boxed::Box<dyn $crate::Generator<Fut = _> + Send + Sync> = ::std::boxed::Box::new(|| {
+                        $crate::futures::future::FutureExt::boxed(
+                            $crate::futures::FutureExt::map(
+                                ($gen)(), ReturnValue::[<$($variant)+>]
+                            )
+                        )
+                    });
+                }
                 let __generator = RecursiveGenerator {
                     inner: __inner,
                 };
                 __futures.push(generate(__generator));
             )+
 
-            let mut stream = $crate::futures::stream::FuturesUnordered::from_iter(__futures);
+            let mut stream = <$crate::futures::stream::FuturesUnordered<_> as ::std::iter::FromIterator<_>>::from_iter(__futures);
             loop {
-                if let Some(flow) = stream.next().await {
-                    match flow {
-                        __ControlFlow::Continue(generator) => {
-                            stream.push(generate(generator));
-                        },
-                        __ControlFlow::Break(v) => break v,
+                if let Some((generator, v)) = $crate::futures::StreamExt::next(&mut stream).await {
+                    $crate::paste!{
+                        match v {
+                            $(ReturnValue::[<$($variant)+>](__v) => if let $bind = __v {
+                                if $c {
+                                    $handle
+                                }
+                            }),+
+                        }
+                        stream.push(generate(generator));
                     }
                 }
             }
@@ -106,35 +112,35 @@ macro_rules! select_loop {
 
     // These rules match a single `select_loop!` branch and normalize it for
     // processing by the first rule.
-    (@ { ( $($s:tt)* ) $($t:tt)* } $p:pat = $f:expr, if $c:expr => $h:block, $($r:tt)* ) => {
-        $crate::select_loop!(@{ ($($s)* _) $($t)* ($($s)*) $p = $f, if $c => $h, } $($r)*)
+    (@ { ( $($last:tt)+ ) $($t:tt)* } $p:pat = $f:expr, if $c:expr => $h:block, $($r:tt)* ) => {
+        $crate::select_loop!(@{ ($($last)+A) $($t)* ($($last)+) $p = $f, if $c => $h, } $($r)*)
     };
-    (@ { ( $($s:tt)* ) $($t:tt)* } $p:pat = $f:expr => $h:block, $($r:tt)* ) => {
-        $crate::select_loop!(@{ ($($s)* _) $($t)* ($($s)*) $p = $f, if true => $h, } $($r)*)
+    (@ { ( $($last:tt)+ ) $($t:tt)* } $p:pat = $f:expr => $h:block, $($r:tt)* ) => {
+        $crate::select_loop!(@{ ($($last)+A) $($t)* ($($last)+) $p = $f, if true => $h, } $($r)*)
     };
-    (@ { ( $($s:tt)* ) $($t:tt)* } $p:pat = $f:expr, if $c:expr => $h:block $($r:tt)* ) => {
-        $crate::select_loop!(@{ ($($s)* _) $($t)* ($($s)*) $p = $f, if $c => $h, } $($r)*)
+    (@ { ( $($last:tt)+ ) $($t:tt)* } $p:pat = $f:expr, if $c:expr => $h:block $($r:tt)* ) => {
+        $crate::select_loop!(@{ ($($last)+A) $($t)* ($($last)+) $p = $f, if $c => $h, } $($r)*)
     };
-    (@ { ( $($s:tt)* ) $($t:tt)* } $p:pat = $f:expr => $h:block $($r:tt)* ) => {
-        $crate::select_loop!(@{ ($($s)* _) $($t)* ($($s)*) $p = $f, if true => $h, } $($r)*)
+    (@ { ( $($last:tt)+ ) $($t:tt)* } $p:pat = $f:expr => $h:block $($r:tt)* ) => {
+        $crate::select_loop!(@{ ($($last)+A) $($t)* ($($last)+) $p = $f, if true => $h, } $($r)*)
     };
-    (@ { ( $($s:tt)* ) $($t:tt)* } $p:pat = $f:expr, if $c:expr => $h:expr ) => {
-        $crate::select_loop!(@{ ($($s)* _) $($t)* ($($s)*) $p = $f, if $c => $h, })
+    (@ { ( $($last:tt)+ ) $($t:tt)* } $p:pat = $f:expr, if $c:expr => $h:expr ) => {
+        $crate::select_loop!(@{ ($($last)+A) $($t)* ($($last)+) $p = $f, if $c => $h, })
     };
-    (@ { ( $($s:tt)* ) $($t:tt)* } $p:pat = $f:expr => $h:expr ) => {
-        $crate::select_loop!(@{ ($($s)* _) $($t)* ($($s)*) $p = $f, if true => $h, })
+    (@ { ( $($last:tt)+ ) $($t:tt)* } $p:pat = $f:expr => $h:expr ) => {
+        $crate::select_loop!(@{ ($($last)+A) $($t)* ($($last)+) $p = $f, if true => $h, })
     };
-    (@ { ( $($s:tt)* ) $($t:tt)* } $p:pat = $f:expr, if $c:expr => $h:expr, $($r:tt)* ) => {
-        $crate::select_loop!(@{ ($($s)* _) $($t)* ($($s)*) $p = $f, if $c => $h, } $($r)*)
+    (@ { ( $($last:tt)+ ) $($t:tt)* } $p:pat = $f:expr, if $c:expr => $h:expr, $($r:tt)* ) => {
+        $crate::select_loop!(@{ ($($last)+A) $($t)* ($($last)+) $p = $f, if $c => $h, } $($r)*)
     };
-    (@ { ( $($s:tt)* ) $($t:tt)* } $p:pat = $f:expr => $h:expr, $($r:tt)* ) => {
-        $crate::select_loop!(@{ ($($s)* _) $($t)* ($($s)*) $p = $f, if true => $h, } $($r)*)
+    (@ { ( $($last:tt)+ ) $($t:tt)* } $p:pat = $f:expr => $h:expr, $($r:tt)* ) => {
+        $crate::select_loop!(@{ ($($last)+A) $($t)* ($($last)+) $p = $f, if true => $h, } $($r)*)
     };
 
     // ===== Entry point =====
 
     ($p:pat = $($t:tt)* ) => {
-        $crate::select_loop!(@{ () } $p = $($t)*)
+        $crate::select_loop!(@{ (A) } $p = $($t)*)
     };
 
     () => {
@@ -142,9 +148,8 @@ macro_rules! select_loop {
     };
 }
 
-
 #[cfg(test)]
-mod tests {
+mod test {
     use super::select_loop;
 
     #[tokio::test]
@@ -168,18 +173,22 @@ mod tests {
         }
 
         let s = "abc".to_string();
+        let mut modify = "hello".to_string();
 
         let value = select_loop! {
             Ok(v) = || succ(&s), if true => {
+                modify.push_str("a");
                 println!("succ passed with {:?}", v);
             }
             Ok(v) = fail1, if v > 0 => {
-                panic!("Impossible: {:?}", v);
+                modify.push_str("b");
+                return ();
             }
             Err(e) = fail2 => {
+                modify.push_str("c");
                 break e;
             }
         };
-        println!("Got {:?}", value);
+        println!("Got {:?}, modify = {}", value, modify);
     }
 }
